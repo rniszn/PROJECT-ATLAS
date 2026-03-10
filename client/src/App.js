@@ -5,11 +5,6 @@ import AIChatbot from './components/AIChatbot';
 import SpotifyPlayer from './components/SpotifyPlayer';
 import './App.css';
 
-// ============================================================
-//  ATLAS — Main App
-//  AI Chatbot + Spotify integration by: Pranathi Udaya Kumar (241IT054)
-// ============================================================
-
 const NavHint = ({ icon, label, onClick, active, color }) => (
   <button
     onClick={onClick}
@@ -35,57 +30,59 @@ function App() {
     if (activeModule === 'study') {
       setLoading(true);
       fetch('http://localhost:5000/api/tasks')
-        .then((res) => { if (!res.ok) throw new Error(); return res.json(); })
-        .then((data) => { setTasks(data); setLoading(false); })
-        .catch(() => {
+        .then((res) => { 
+          if (!res.ok) throw new Error("Network response was not ok"); 
+          return res.json(); 
+        })
+        .then((data) => { 
+          setTasks(data); 
+          setLoading(false); 
+        })
+        .catch((err) => {
+          console.error("API Fetch Error:", err);
           setTasks([{ id: 99, title: '❌ Cannot connect to backend server', priority: 'High', status: 'Error' }]);
           setLoading(false);
         });
     }
   }, [activeModule]);
 
-  const drawerBorderColor = activeModule === 'music' ? 'rgba(29,185,84,0.3)' : 'rgba(0,212,255,0.3)';
+  const drawerBorderColor = activeModule === 'music' ? 'rgba(29,185,84,0.3)' : 
+                           activeModule === 'ai' ? 'rgba(0,212,255,0.3)' : 'rgba(255,159,67,0.3)';
 
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#050505', position: 'relative' }}>
 
-      {/* 3D WORKSPACE — Harshith's layer */}
       <Canvas shadows camera={{ position: [5, 5, 5], fov: 50 }}>
         <Suspense fallback={null}>
           <Experience setActiveModule={setActiveModule} />
         </Suspense>
       </Canvas>
 
-      {/* BRANDING */}
       <div style={{ position: 'absolute', top: 20, left: 24, color: 'white', pointerEvents: 'none', fontFamily: "'Orbitron', monospace" }}>
         <h1 style={{ margin: 0, fontSize: 26, letterSpacing: 6, textShadow: '0 0 20px rgba(0,212,255,0.6)' }}>ATLAS</h1>
         <p style={{ opacity: 0.5, fontSize: 10, letterSpacing: 3, margin: '4px 0 0' }}>ACADEMIC VIRTUAL WORKSPACE</p>
       </div>
 
-      {/* BOTTOM NAV */}
       <div style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 10, fontFamily: "'Rajdhani', monospace" }}>
         <NavHint icon="🤖" label="AI"    onClick={() => setActiveModule(activeModule === 'ai'    ? null : 'ai')}    active={activeModule === 'ai'}    color="#00d4ff" />
         <NavHint icon="🎵" label="Music" onClick={() => setActiveModule(activeModule === 'music'  ? null : 'music')} active={activeModule === 'music'} color="#1db954" />
         <NavHint icon="📚" label="Study" onClick={() => setActiveModule(activeModule === 'study'  ? null : 'study')} active={activeModule === 'study'} color="#ff9f43" />
       </div>
 
-      {/* MODULE DRAWER */}
       {activeModule && (
         <div style={{
           position: 'absolute', top: 0, right: 0, width: 400, height: '100vh',
           background: 'rgba(8, 10, 14, 0.92)', backdropFilter: 'blur(24px)',
           borderLeft: `1px solid ${drawerBorderColor}`,
-          padding: '32px 28px', animation: 'slideIn 0.25s ease-out',
+          padding: '32px 28px', 
           overflowY: 'auto', boxSizing: 'border-box', display: 'flex', flexDirection: 'column',
+          zIndex: 100
         }}>
 
-          {/* AI CHATBOT — Pranathi's Gemini integration */}
           {activeModule === 'ai' && <AIChatbot onClose={() => setActiveModule(null)} />}
 
-          {/* SPOTIFY PLAYER — Pranathi's Spotify integration */}
           {activeModule === 'music' && <SpotifyPlayer onClose={() => setActiveModule(null)} />}
 
-          {/* STUDY MODULE — Rohan's backend tasks */}
           {activeModule === 'study' && (
             <div style={{ color: 'white', height: '100%', display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 20, borderBottom: '1px solid rgba(255,153,67,0.3)', marginBottom: 20 }}>
@@ -95,6 +92,7 @@ function App() {
                 </div>
                 <button style={{ background: 'none', border: 'none', color: '#ff9f43', fontSize: 20, cursor: 'pointer' }} onClick={() => setActiveModule(null)}>✕</button>
               </div>
+              
               {loading ? (
                 <div style={{ color: '#ff9f43', fontSize: 13, textAlign: 'center', padding: 30 }}>⏳ Syncing with Atlas server...</div>
               ) : (
