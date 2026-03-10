@@ -1,0 +1,595 @@
+﻿<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Atlas Project Document</title>
+    <style>
+        @page {
+            margin: 1in;
+        }
+        body {
+            font-family: 'Times New Roman', Times, serif;
+            font-size: 12pt;
+            line-height: 1.5;
+            max-width: 8.5in;
+            margin: 0 auto;
+            padding: 1in;
+            background: white;
+            color: black;
+        }
+        h1 {
+            text-align: center;
+            font-size: 16pt;
+            font-weight: bold;
+            margin-bottom: 0.2em;
+        }
+        h2 {
+            text-align: center;
+            font-size: 14pt;
+            font-weight: bold;
+            margin-bottom: 0.5em;
+        }
+        h3 {
+            text-align: center;
+            font-size: 12pt;
+            font-weight: bold;
+            margin-bottom: 1em;
+        }
+        .metadata {
+            text-align: center;
+            margin-bottom: 1.5em;
+        }
+        .section-title {
+            font-size: 12pt;
+            font-weight: bold;
+            margin-top: 1em;
+            margin-bottom: 0.5em;
+        }
+        .subsection-title {
+            font-size: 12pt;
+            font-weight: bold;
+            margin-top: 0.8em;
+            margin-bottom: 0.3em;
+            font-style: italic;
+        }
+        p {
+            text-align: justify;
+            margin-bottom: 0.5em;
+        }
+        ul {
+            margin-left: 1.5em;
+            margin-bottom: 0.5em;
+        }
+        li {
+            margin-bottom: 0.3em;
+        }
+        .download-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            z-index: 1000;
+        }
+        .download-btn:hover {
+            background: #45a049;
+        }
+        @media print {
+            .download-btn {
+                display: none;
+            }
+            body {
+                padding: 0;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    
+
+    <h1>IT254 - Web Technologies and Applications</h1>
+    <h2>Course Project Document</h2>
+    
+    <div class="metadata">
+        <p><strong>Project Title:</strong> Atlas - An Interactive Web-Based Study Companion</p>
+        <p><strong>Team Members:</strong> Harshith R (241IT032), Pranathi Udaya Kumar (241IT054), Rohan G (241IT064)</p>
+        <p><strong>Submission Date:</strong> January 23, 2026</p>
+    </div>
+
+    <hr>
+
+    <div class="section-title">1. Project Overview and Objective</div>
+    <p>Atlas is an innovative web-based study companion designed to serve as a comprehensive routine management and productivity platform for students. The primary objective is to create an engaging, user-friendly interface that consolidates multiple study-related functionalities into a single, accessible web application.</p>
+    
+    <p><strong>Core Objectives:</strong></p>
+    <ul>
+        <li>Develop an interactive web interface with an intuitive navigation system guided by a virtual assistant</li>
+        <li>Integrate multiple productivity modules including task management, study time tracking, and syllabus organization</li>
+        <li>Provide seamless access to entertainment features like music playback to enhance the study environment</li>
+        <li>Implement an AI-powered chatbot for instant doubt clarification and academic support</li>
+        <li>Create a centralized platform that eliminates the need for students to switch between multiple applications</li>
+    </ul>
+    
+    <p>The project aims to demonstrate practical implementation of modern web technologies while solving real-world problems faced by students in managing their academic routines effectively.</p>
+
+    <div class="section-title">2. Innovation and Unique Features</div>
+    
+    <div class="subsection-title">Interactive Virtual Guide:</div>
+    <p>Atlas introduces an innovative approach to web navigation through a virtual robot guide that welcomes users and assists them in navigating through different sections of the application. This gamified approach makes the platform more engaging and user-friendly, especially for students who may feel overwhelmed by traditional productivity tools.</p>
+    
+    <div class="subsection-title">Module-Based Interactive Interface:</div>
+    <p>The application features an immersive 3D or interactive 2D workspace where different modules are represented as visual objects (books, tables, music systems, etc.). Users can click on these objects to access corresponding functionalities, creating an intuitive and memorable user experience that goes beyond conventional menu-based navigation.</p>
+    
+    <div class="subsection-title">All-in-One Integration:</div>
+    <p>Unlike existing solutions that focus on single aspects of student life, Atlas integrates multiple functionalities:</p>
+    <ul>
+        <li>Academic planning (syllabus management, study schedules)</li>
+        <li>Task management (to-do lists with priority settings)</li>
+        <li>Time tracking (study duration monitoring and analytics)</li>
+        <li>Entertainment integration (local music playback and streaming platform access)</li>
+        <li>AI assistance (instant chatbot for doubt clarification)</li>
+    </ul>
+    
+    <div class="subsection-title">Personalized Study Environment:</div>
+    <p>The music module represents a unique innovation by allowing students to access both their local music files and streaming platforms like Spotify directly within the study interface, enabling them to create their ideal study atmosphere without leaving the application.</p>
+    
+    <div class="subsection-title">Contextual AI Chatbot:</div>
+    <p>Integration of an AI-powered chatbot provides instant academic support, allowing students to clarify doubts, get explanations, and receive study guidance without interrupting their workflow.</p>
+
+    <div class="section-title">3. Problem Statement and Existing Challenges</div>
+    
+    <p><strong>Current Problems Faced by Students:</strong></p>
+    <ul>
+        <li><strong>Fragmented Digital Workspace:</strong> Students currently juggle multiple applications for different tasks—separate apps for to-do lists, time tracking, study materials, music, and doubt clarification. This constant switching reduces productivity and increases cognitive load.</li>
+        <li><strong>Lack of Engagement:</strong> Traditional productivity tools are often bland and uninspiring, leading to poor user adoption and inconsistent usage among students.</li>
+        <li><strong>Poor Time Management:</strong> Many students struggle with tracking study hours and managing their time effectively across different subjects and tasks.</li>
+        <li><strong>Limited Accessibility to Resources:</strong> Students need quick access to syllabi, study materials, and academic support, but these are often scattered across different platforms and locations.</li>
+        <li><strong>Study Environment Disruption:</strong> The need to switch applications for basic needs like playing music breaks concentration and workflow.</li>
+    </ul>
+    
+    <p><strong>Why Existing Solutions Fall Short:</strong></p>
+    <ul>
+        <li>Task management apps like Todoist or Notion lack integrated entertainment and AI support</li>
+        <li>Music platforms like Spotify don't offer academic productivity features</li>
+        <li>Study planners don't provide entertainment or real-time doubt clarification</li>
+        <li>No single platform offers an engaging, interactive interface that combines all these elements</li>
+    </ul>
+
+    <div class="section-title">4. Proposed Solution and Methodology</div>
+    
+    <div class="subsection-title">Atlas Architecture:</div>
+    <p>The application will be structured around an interactive homepage featuring a virtual environment where different modules are represented visually. The virtual robot guide will provide contextual help and navigation assistance.</p>
+    
+    <p><strong>Key Modules:</strong></p>
+    
+    <p><strong>1. Study Module (Book/Table Interface):</strong></p>
+    <ul>
+        <li>To-do list creation with task prioritization</li>
+        <li>Study duration tracker with analytics</li>
+        <li>Syllabus organizer with subject-wise breakdown</li>
+        <li>Progress tracking and goal setting</li>
+    </ul>
+    
+    <p><strong>2. Music Module (Music System Interface):</strong></p>
+    <ul>
+        <li>Local file system access for music playback</li>
+        <li>Integration with streaming platforms (Spotify, YouTube Music)</li>
+        <li>Playlist creation for different study moods</li>
+        <li>Background playback controls</li>
+    </ul>
+    
+    <p><strong>3. AI Chatbot Module:</strong></p>
+    <ul>
+        <li>Real-time doubt clarification</li>
+        <li>Study tips and recommendations</li>
+        <li>Quick explanations of concepts</li>
+        <li>Resource suggestions</li>
+    </ul>
+    
+    <p><strong>4. Dashboard and Analytics:</strong></p>
+    <ul>
+        <li>Visual representation of study patterns</li>
+        <li>Productivity metrics and insights</li>
+        <li>Calendar integration for deadlines and exams</li>
+    </ul>
+
+    <div class="section-title">5. Technologies and Tools</div>
+    
+    <p><strong>Frontend Technologies:</strong></p>
+    <ul>
+        <li><strong>HTML5/CSS3:</strong> Structure and styling of the web interface</li>
+        <li><strong>JavaScript (ES6+):</strong> Interactive functionality and module logic</li>
+        <li><strong>React.js or Vue.js:</strong> Component-based UI development for better maintainability</li>
+        <li><strong>Three.js or Canvas API:</strong> Creating the interactive 3D/2D virtual environment</li>
+        <li><strong>Tailwind CSS or Bootstrap:</strong> Responsive design framework</li>
+    </ul>
+    
+    <p><strong>Backend Technologies:</strong></p>
+    <ul>
+        <li><strong>Node.js with Express.js:</strong> Server-side logic and API development</li>
+        <li><strong>RESTful API:</strong> Communication between frontend and backend</li>
+        <li><strong>WebSocket (Socket.io):</strong> Real-time chatbot communication</li>
+    </ul>
+    
+    <p><strong>Database:</strong></p>
+    <ul>
+        <li><strong>MongoDB or PostgreSQL:</strong> Storing user data, tasks, study logs, and preferences</li>
+        <li><strong>Local Storage/IndexedDB:</strong> Client-side data persistence for offline functionality</li>
+    </ul>
+    
+    <p><strong>Additional Tools and APIs:</strong></p>
+    <ul>
+        <li><strong>Spotify Web API:</strong> Integration with Spotify for music streaming</li>
+        <li><strong>File System Access API:</strong> Local music file access (where supported)</li>
+        <li><strong>OpenAI API or similar:</strong> AI chatbot implementation</li>
+        <li><strong>Chart.js or D3.js:</strong> Data visualization for analytics</li>
+        <li><strong>Git/GitHub:</strong> Version control and collaboration</li>
+    </ul>
+    
+    <p><strong>Development Tools:</strong></p>
+    <ul>
+        <li><strong>VS Code:</strong> Primary development environment</li>
+        <li><strong>Postman:</strong> API testing</li>
+        <li><strong>Browser DevTools:</strong> Debugging and performance optimization</li>
+    </ul>
+
+    <div class="section-title">6. Expected Outcomes and Benefits</div>
+    
+    <p><strong>For Students:</strong></p>
+    <ul>
+        <li>Improved productivity through centralized workspace</li>
+        <li>Better time management with integrated tracking</li>
+        <li>Enhanced study experience with personalized music integration</li>
+        <li>Instant academic support through AI chatbot</li>
+        <li>Engaging interface that encourages consistent usage</li>
+    </ul>
+    
+    <p><strong>Technical Learning:</strong></p>
+    <ul>
+        <li>Practical experience with modern web development frameworks</li>
+        <li>Understanding of API integration and data management</li>
+        <li>Implementation of AI/ML features in web applications</li>
+        <li>User interface and user experience design principles</li>
+        <li>Full-stack development workflow</li>
+    </ul>
+    
+    <p><strong>Project Deliverables:</strong></p>
+    <ul>
+        <li>Fully functional web application with all proposed modules</li>
+        <li>Responsive design compatible with desktop and mobile devices</li>
+        <li>User authentication and personalized data storage</li>
+        <li>Comprehensive documentation and user guide</li>
+        <li>Demonstration of real-world problem-solving through technology</li>
+    </ul>
+
+    <div class="section-title">7. Conclusion</div>
+    <p>Atlas represents an innovative approach to student productivity by creating an engaging, all-in-one platform that addresses real challenges faced by students in their daily academic routines. By combining essential study tools with entertainment features and AI assistance in an interactive interface, the project demonstrates the practical application of modern web technologies to solve real-world problems. This project will not only serve as a valuable learning experience in web development but also has the potential to become a useful tool for students seeking to optimize their study routines and academic performance.</p>
+
+    <script>
+        function downloadDoc() {
+            // Clone the document
+            const content = document.documentElement.outerHTML;
+            
+            // Create a clean version without the button
+            const cleanContent = content.replace(/<button[^>]*>.*?<\/button>/gi, '');
+            
+            // Create blob with proper Word document structure
+            const blob = new Blob(['\ufeff', cleanContent], {
+                type: 'application/msword'
+            });
+            
+            // Create download link
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'Atlas_Project_Document.doc';
+            
+            // Trigger download
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        // Also enable Ctrl+P for printing
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
+                e.preventDefault();
+                window.print();
+            }
+        });
+    </script>
+
+</body></html>
